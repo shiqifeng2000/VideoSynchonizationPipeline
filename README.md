@@ -10,7 +10,7 @@
 
 ## 🚀 Overview
 
-This project enables **direct texture mapping** from hardware-decoded video frames to application-layer OpenGL textures — achieving seamless, low-latency synchronization between decode and render pipelines such as Unity, Qt, . No CPU-side copies, no buffer transfers. Just pure GPU-to-GPU efficiency.
+This project enables **direct texture mapping** from hardware-decoded video frames to application-layer OpenGL/D3D11 textures — achieving seamless, low-latency synchronization between decode and render pipelines such as Unity, Qt, . No CPU-side copies, no buffer transfers. Just pure GPU-to-GPU efficiency.
 
 > **Ideal for:** Multi-view video walls, real-time AIGC dashboards, immersive installations, and any high-throughput heterogeneous computing scenario.
 
