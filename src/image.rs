@@ -1,4 +1,9 @@
-use crate::app::{App, CudaFrame, GluResource, GluResourceCtrl, GluResourceStatInfo, UserEvent};
+use crate::app::{
+    AppRunner, CudaFrame, GluResource, GluResourceCtrl, GluResourceStatInfo, UserEvent,
+};
+use crate::cuda::{
+    CUDA_GRAPHIC_REGISTER_FLAG_SURFACE_LOAD_STORE, cudaGraphicsD3D11RegisterResource,
+};
 use crate::{
     cuda::{
         CUDA_MEMCPY_DEVICE_TO_DEVICE, CUDA_MEMCPY_HOST_TO_DEVICE, cudaFree,
@@ -117,7 +122,7 @@ pub struct GluResourceImage {
     pub path: String,
     /// gpu显存指针
     cache_rgb: *mut std::ffi::c_void,
-    pub tex_rgb_id: Option<u32>,
+    pub tex_rgb_id: Option<*mut std::ffi::c_void>,
     // pub tex_uv_id: Option<u32>,
     res_rgb: Option<*mut std::ffi::c_void>,
     // res_uv: Option<*mut std::ffi::c_void>,
@@ -219,18 +224,23 @@ impl GluResource for GluResourceImage {
         Ok(())
     }
     fn seek(&self, _timestap: i64) {}
-    fn register(&mut self, tex_rgb_id: u32) -> Result<()> {
+    fn register(&mut self, tex_rgba_id: *mut std::ffi::c_void) -> Result<()> {
         let res_rgb = {
             let mut res = null_mut();
-            cuda_error!(cudaGraphicsGLRegisterImage(
+            // cuda_error!(cudaGraphicsGLRegisterImage(
+            //     &mut res,
+            //     tex_rgb_id,
+            //     glow::TEXTURE_2D,
+            //     0
+            // ))?;
+            cuda_error!(cudaGraphicsD3D11RegisterResource(
                 &mut res,
-                tex_rgb_id,
-                glow::TEXTURE_2D,
-                0
+                tex_rgba_id,
+                CUDA_GRAPHIC_REGISTER_FLAG_SURFACE_LOAD_STORE,
             ))?;
             res
         };
-        self.tex_rgb_id.replace(tex_rgb_id);
+        self.tex_rgb_id.replace(tex_rgba_id);
         self.res_rgb.replace(res_rgb);
         // let res_uv = {
         //     let mut res = null_mut();
@@ -406,7 +416,7 @@ pub fn run_image_window() -> Result<()> {
     }
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
-    let mut app = App::new(running, resources, None);
+    let mut app = AppRunner::new(running, resources, None);
     let (sndr, rcvr) = std::sync::mpsc::channel::<i32>();
     ctrlc::set_handler(move || {
         log::warn!("Ctrl-C received, gracefully clearing up cuda");

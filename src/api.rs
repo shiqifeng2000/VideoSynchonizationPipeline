@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 #[repr(C)]
 pub struct UnityParam {
-    pub texture_rgba_ids: *const std::ffi::c_uint,
+    pub texture_rgba_ids: *const *mut std::ffi::c_void,
     pub length: std::ffi::c_int,
     pub handle: *const std::ffi::c_void,
     pub code: std::ffi::c_int,
@@ -106,7 +106,7 @@ pub extern "C" fn register_textures(_evt_id: std::ffi::c_int, param: *mut std::f
             std::slice::from_raw_parts((*param).texture_rgba_ids, (*param).length as usize)
                 .into_iter()
                 .map(|v| *v)
-                .collect();
+                .collect::<Vec<*mut std::ffi::c_void>>();
 
         let glu_player = Arc::from_raw((*param).handle as *const Mutex<GluPlayer>);
         let player_rst = elogger!(glu_player.lock());
@@ -118,7 +118,7 @@ pub extern "C" fn register_textures(_evt_id: std::ffi::c_int, param: *mut std::f
         }
         let mut player = player_rst.unwrap();
 
-        if elogger!(player.register_textures(texture_ids)).is_err() {
+        if elogger!(player.register_textures(&texture_ids)).is_err() {
             drop(player);
             Arc::into_raw(glu_player) as *const std::ffi::c_void;
             (*param).code = -2;

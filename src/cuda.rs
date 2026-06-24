@@ -14,6 +14,11 @@ unsafe extern "C" {
         target: u32,
         flags: u32,
     ) -> i32;
+    pub fn cudaGraphicsD3D11RegisterResource(
+        cuda_resource: *mut *mut std::ffi::c_void,
+        d3d_resource: *mut std::ffi::c_void,
+        flags: u32,
+    ) -> i32;
     pub fn cudaGraphicsUnregisterResource(resource: *mut std::ffi::c_void) -> i32;
     pub fn cudaGraphicsMapResources(
         count: i32,
@@ -112,6 +117,7 @@ pub const CUDA_MEMCPY_HOST_TO_HOST: i32 = 0;
 pub const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
 pub const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
 pub const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
+pub const CUDA_GRAPHIC_REGISTER_FLAG_SURFACE_LOAD_STORE: u32 = 4;
 
 // #[repr(C)]
 // #[derive(Debug, Copy, Clone)]

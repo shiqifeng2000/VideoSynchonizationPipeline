@@ -5,16 +5,22 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#define CUDA_GRAPHIC_REGISTER_FLAG_SURFACE_LOAD_STORE 4
+
 #define CHANNEL_SIZE 10
+
+#define AUDIO_SAMPLES 1024
+
+#define AUDIO_MAX_DELAY 50
 
 typedef void (*UnityRenderThreadEventData)(int, void *);
 
 typedef struct UnityParam
 {
-    const unsigned int *texture_rgba_ids;
-    int length;
-    const void *handle;
-    int code;
+  void *const *texture_rgba_ids;
+  int length;
+  const void *handle;
+  int code;
 } UnityParam;
 
 /**
@@ -59,6 +65,7 @@ void draw_frames(int _evt_id,
                  void *param);
 
 /**
+ * 回收播放帧序列，将[load_frames]得到的数据放回到缓存队列中，用于后续解码使用，节约内存和显存
  * 播控，暂停，再次触发则恢复播放态，播控操作不建议1秒内频繁操作
  */
 int pause_player(const void *player);

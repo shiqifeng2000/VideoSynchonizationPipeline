@@ -2,11 +2,12 @@
 //! HW-accelerated decoding example using rsmpeg
 use crate::{
     app::{
-        App, AudioFrame, CudaFrame, DecodedFrame, GluResource, GluResourceCtrl,
+        AppRunner, AudioFrame, CudaFrame, DecodedFrame, GluResource, GluResourceCtrl,
         GluResourceCtrlSync, GluResourceStat, GluResourceStatInfo, GluResourceState, UserEvent,
     },
     cuda::{
-        CUDA_MEMCPY_DEVICE_TO_DEVICE, NppStreamContext, NppiSize, cudaFree,
+        CUDA_GRAPHIC_REGISTER_FLAG_SURFACE_LOAD_STORE, CUDA_MEMCPY_DEVICE_TO_DEVICE,
+        NppStreamContext, NppiSize, cudaFree, cudaGraphicsD3D11RegisterResource,
         cudaGraphicsGLRegisterImage, cudaGraphicsMapResources,
         cudaGraphicsSubResourceGetMappedArray, cudaGraphicsUnmapResources,
         cudaGraphicsUnregisterResource, cudaMalloc, cudaMemcpy2D, cudaMemcpy2DToArray,
@@ -175,15 +176,22 @@ impl GluResourceVideo {
         })
     }
 
-    fn register_resource(&mut self, tex_rgba_id: u32) -> Result<()> {
+    fn register_resource(&mut self, tex_rgba_id: *mut std::ffi::c_void) -> Result<()> {
+        //  tex_rgba_id: u32
         self.unregister_resource()?;
         let res_rgba = {
             let mut res = null_mut();
-            cuda_error!(cudaGraphicsGLRegisterImage(
+            // cuda_error!(cudaGraphicsGLRegisterImage(
+            //     &mut res,
+            //     tex_rgba_id,
+            //     glow::TEXTURE_2D,
+            //     0
+            // ))?;
+
+            cuda_error!(cudaGraphicsD3D11RegisterResource(
                 &mut res,
                 tex_rgba_id,
-                glow::TEXTURE_2D,
-                0
+                CUDA_GRAPHIC_REGISTER_FLAG_SURFACE_LOAD_STORE,
             ))?;
             res
         };
@@ -248,7 +256,7 @@ impl GluResource for GluResourceVideo {
     fn seek(&self, _timestap: i64) {
         // let _ = self.ctrl.command.send(GluResourceCommand::seek(timestap));
     }
-    fn register(&mut self, tex_rgba_id: u32) -> Result<()> {
+    fn register(&mut self, tex_rgba_id: *mut std::ffi::c_void) -> Result<()> {
         self.register_resource(tex_rgba_id)
     }
     fn unregister(&mut self) -> Result<()> {
@@ -304,11 +312,12 @@ impl GluResource for GluResourceVideo {
 
 #[derive(Clone)]
 struct GluResourceVideoTextures {
-    _tex_rgba_id: u32,
+    // _tex_rgba_id: u32,
+    _tex_rgba_id: *mut std::ffi::c_void,
     res_rgba: *mut std::ffi::c_void,
 }
 impl GluResourceVideoTextures {
-    pub fn new(tex_rgba_id: u32, res_rgba: *mut std::ffi::c_void) -> Self {
+    pub fn new(tex_rgba_id: *mut std::ffi::c_void, res_rgba: *mut std::ffi::c_void) -> Self {
         Self {
             _tex_rgba_id: tex_rgba_id,
             res_rgba,
@@ -1177,7 +1186,7 @@ impl GluPlayer {
             .collect()
     }
 
-    pub fn register_textures(&mut self, texture_rgba_ids: Vec<u32>) -> Result<()> {
+    pub fn register_textures(&mut self, texture_rgba_ids: &[*mut std::ffi::c_void]) -> Result<()> {
         if self.videos.len() < texture_rgba_ids.len() {
             return Err(anyhow!("texture id len mismatch"));
         }
@@ -1346,7 +1355,7 @@ pub fn run_video_window(type_: i32, view_ports: usize) -> Result<()> {
     let sync_ctrl = GluResourceCtrlSync::new(state, &resources, decode_rcvr, master)?;
     // app.resources = resources;
     // app.sync_ctrl.replace(sync_ctrl);
-    let mut app = App::new(running, resources, Some(sync_ctrl));
+    let mut app = AppRunner::new(running, resources, Some(sync_ctrl));
     let (sndr, rcvr) = std::sync::mpsc::channel::<i32>();
     ctrlc::set_handler(move || {
         log::warn!("Ctrl-C received, gracefully clearing up cuda");

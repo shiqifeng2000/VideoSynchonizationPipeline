@@ -5,12 +5,18 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#define CUDA_GRAPHIC_REGISTER_FLAG_SURFACE_LOAD_STORE 4
+
 #define CHANNEL_SIZE 10
+
+#define AUDIO_SAMPLES 1024
+
+#define AUDIO_MAX_DELAY 50
 
 typedef void (*UnityRenderThreadEventData)(int, void*);
 
 typedef struct UnityParam {
-  const unsigned int *texture_rgba_ids;
+  void *const *texture_rgba_ids;
   int length;
   const void *handle;
   int code;

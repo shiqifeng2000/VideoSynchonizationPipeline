@@ -1,23 +1,27 @@
 use crate::cuda::{cudaFree, cudaMalloc, cudaMemset2D};
 use crate::utils::{AudioCtrl, CHANNEL_SIZE};
 use crate::{cuda_check, cuda_error, elogger};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use glow::HasContext;
-use glutin::config::ConfigTemplateBuilder;
-use glutin::context::{ContextAttributesBuilder, PossiblyCurrentContext};
-use glutin::display::GetGlDisplay;
-use glutin::prelude::*;
-use glutin::surface::{Surface, SurfaceAttributesBuilder, SwapInterval, WindowSurface};
-use glutin_winit::DisplayBuilder;
 use std::collections::HashMap;
-use std::ffi::CString;
-use std::num::NonZeroU32;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 use std::{f64, usize};
+use windows::Win32::Graphics::Direct3D::D3D11_SRV_DIMENSION_TEXTURE2D;
+use windows::Win32::Graphics::Direct3D11::{D3D11_TEX2D_SRV, ID3D11Multithread, ID3D11Resource};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_R8G8B8A8_UNORM};
+use windows::Win32::Graphics::Dxgi::DXGI_PRESENT;
+use windows::Win32::{
+    Foundation::{HMODULE, HWND},
+    Graphics::{
+        Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0},
+        Direct3D11, Dxgi,
+    },
+};
+use windows::core::Interface;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -29,6 +33,7 @@ use winit::window::{Window, WindowAttributes};
 
 const WIDTH: i32 = 1920;
 const HEIGHT: i32 = 1080;
+const PADDING: i32 = 4;
 // pub const VIEW_PORTS: usize = 5;
 // macro_rules! cuda_check {
 //     ($expr:expr, $msg:expr) => {{
@@ -41,18 +46,365 @@ const HEIGHT: i32 = 1080;
 //     }};
 // }
 
-// #[derive(Default)]
-pub struct App {
-    pub running: Arc<AtomicBool>,
-    pub window: Option<Window>,
-    pub gl: Option<glow::Context>,
-    pub surface: Option<Surface<WindowSurface>>,
-    pub context: Option<PossiblyCurrentContext>,
+pub struct D3d11App {
+    device: Direct3D11::ID3D11Device,
+    device_context: Direct3D11::ID3D11DeviceContext,
+    swap_chain: Dxgi::IDXGISwapChain,
+    render_target: Option<Direct3D11::ID3D11RenderTargetView>,
+    egui_ctx: egui::Context,
+    egui_renderer: egui_directx11::Renderer,
+    egui_winit: egui_winit::State,
+    multithread: Option<ID3D11Multithread>,
+    tex_rgba: Vec<egui::TextureId>,
+}
 
-    pub tex_rgb: Vec<glow::NativeTexture>,
-    pub resources: Vec<Box<dyn GluResource>>,
-    pub program: Option<glow::Program>,
-    pub vao: Option<glow::NativeVertexArray>,
+impl D3d11App {
+    pub fn new(window: &Window) -> Result<Self> {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let RawWindowHandle::Win32(window_handle) = window.window_handle()?.as_raw() else {
+            bail!("Unexpected RawWindowHandle variant");
+        };
+
+        let (device, device_context, swap_chain) = {
+            let PhysicalSize { width, height } = window.inner_size();
+            Self::create_device_and_swap_chain(
+                HWND(window_handle.hwnd.get() as _),
+                width,
+                height,
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+            )
+        }
+        .context("Failed to create device and swap chain")?;
+
+        let render_target = Some(
+            Self::create_render_target_for_swap_chain(&device, &swap_chain)
+                .context("Failed to create render target")?,
+        );
+
+        let egui_ctx = egui::Context::default();
+        let egui_renderer =
+            egui_directx11::Renderer::new(&device).context("Failed to create egui renderer")?;
+        let egui_winit = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui_ctx.viewport_id(),
+            &window,
+            None,
+            None,
+            None,
+        );
+
+        Ok(Self {
+            device,
+            device_context,
+            swap_chain,
+            render_target,
+            egui_ctx,
+            egui_renderer,
+            egui_winit,
+            tex_rgba: vec![],
+            multithread: None,
+        })
+    }
+
+    pub fn create_textures(&mut self, resources: &mut Vec<Box<dyn GluResource>>) -> Result<()> {
+        for resource in resources {
+            let Some(GluResourceStatInfo { width, height, .. }) = resource.get_info() else {
+                continue;
+            };
+            // Image source: https://www.publicdomainpictures.net/en/view-image.php?image=308608
+            // let bytes = Decoder::new(BufReader::new(&include_bytes!("./1080p.jpg")[..]))
+            //     .decode()
+            //     .unwrap();
+            // let bytes = Vec::from_iter(
+            //     bytes
+            //         .chunks_exact(3)
+            //         .map(|slice| u32::from_le_bytes([slice[0], slice[1], slice[2], 0])),
+            // );
+            let desc = Direct3D11::D3D11_TEXTURE2D_DESC {
+                Width: width as _,
+                Height: height as _,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: Direct3D11::D3D11_USAGE_DEFAULT,
+                BindFlags: Direct3D11::D3D11_BIND_SHADER_RESOURCE.0 as _,
+                CPUAccessFlags: 0,
+                ..Default::default()
+            };
+            // let subresource_data = Direct3D11::D3D11_SUBRESOURCE_DATA {
+            //     pSysMem: bytes.as_ptr() as _,
+            //     SysMemPitch: (1920 * 4) as u32,
+            //     SysMemSlicePitch: 0,
+            // };
+            let mut texure = None;
+            unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut texure)) }.unwrap();
+            let texure = texure.unwrap();
+
+            resource.register(texure.as_raw())?;
+
+            let mut shader_resource_view = None;
+            let shader_desc = Direct3D11::D3D11_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
+                Anonymous: Direct3D11::D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: 1,
+                    },
+                },
+            };
+            // device.CreateShaderResourceView(&texture, &shader_desc, &mut srv)?;
+            unsafe {
+                self.device.CreateShaderResourceView(
+                    &texure,
+                    Some(&shader_desc),
+                    Some(&raw mut shader_resource_view),
+                )
+            }
+            .context("CreateShaderResourceView Failed")?;
+            let srv = shader_resource_view.unwrap();
+            let id = self.egui_renderer.register_user_texture(srv);
+            self.tex_rgba.push(id);
+        }
+        Ok(())
+    }
+
+    // fn on_event(&mut self, window: &Window, event: &WindowEvent) {
+    //     let egui_response = self.egui_winit.on_window_event(&window, event);
+    //     if !egui_response.consumed {
+    //         match event {
+    //             WindowEvent::Resized(new_size) => self.resize(new_size),
+    //             WindowEvent::RedrawRequested => self.render(window),
+    //             _ => (),
+    //         }
+    //     }
+    // }
+
+    // fn on_exit(&mut self) {
+    //     for texure in self.tex_rgba.split_off(0) {
+    //         self.egui_renderer.unregister_user_texture(texure);
+    //     }
+    // }
+
+    fn multithread_enter(&self) {
+        if let Some(multithread) = &self.multithread {
+            unsafe { multithread.Enter() };
+        }
+    }
+    fn multithread_leave(&self) {
+        if let Some(multithread) = &self.multithread {
+            unsafe { multithread.Leave() };
+        }
+    }
+    fn render(&mut self, window: &Window) {
+        if let Some(render_target) = &self.render_target {
+            let size = window.inner_size();
+            let inner_width = size.width as i32;
+            let inner_height = size.height as i32;
+            let matrix = (self.tex_rgba.len() as f32).sqrt().ceil() as usize;
+
+            let cell_width = (inner_width - PADDING) / matrix as i32;
+            let cell_height = (inner_height - PADDING) / matrix as i32;
+            
+            let egui_input = self.egui_winit.take_egui_input(window);
+            let tex_rgba = self.tex_rgba.clone();
+            let egui_output = self.egui_ctx.run(egui_input, |ctx| {
+                let tex_rgba = tex_rgba.clone();
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::none() // 移除默认边框和内边距
+                            .inner_margin(egui::Margin::ZERO)
+                            .outer_margin(egui::Margin::ZERO),
+                    )
+                    .show(ctx, |ui| {
+                        egui::Grid::new("video_grid")
+                            .num_columns(matrix)
+                            .spacing([PADDING as f32, PADDING as f32])
+                            .show(ui, |ui| {
+                                for (i, texure) in tex_rgba.into_iter().enumerate() {
+                                    if i > 0 && i % matrix == 0 {
+                                        ui.end_row();
+                                    }
+                                    let image = egui::widgets::Image::from_texture((
+                                        texure,
+                                        egui::Vec2::new(cell_width as f32, cell_height as f32),
+                                    ))
+                                    .max_size(
+                                        egui::Vec2::new(cell_width as f32, cell_height as f32),
+                                    );
+                                    // .shrink_to_fit();
+                                    ui.add(image);
+                                }
+                            });
+                    });
+            });
+            let (renderer_output, platform_output, _) = egui_directx11::split_output(egui_output);
+            self.egui_winit
+                .handle_platform_output(window, platform_output);
+            unsafe {
+                self.device_context
+                    .ClearRenderTargetView(render_target, &[0.0, 0.0, 0.0, 1.0]);
+            }
+            let _ = self.egui_renderer.render(
+                &self.device_context,
+                render_target,
+                &self.egui_ctx,
+                renderer_output,
+            );
+            let _ = unsafe { self.swap_chain.Present(1, DXGI_PRESENT(0)) };
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn create_device_and_swap_chain(
+        window: HWND,
+        frame_width: u32,
+        frame_height: u32,
+        frame_format: DXGI_FORMAT,
+    ) -> Result<(
+        Direct3D11::ID3D11Device,
+        Direct3D11::ID3D11DeviceContext,
+        Dxgi::IDXGISwapChain,
+    )> {
+        let dxgi_factory: Dxgi::IDXGIFactory = unsafe { Dxgi::CreateDXGIFactory() }?;
+        let dxgi_adapter: Dxgi::IDXGIAdapter = unsafe { dxgi_factory.EnumAdapters(0) }?;
+
+        let mut device = None;
+        let mut device_context = None;
+        unsafe {
+            Direct3D11::D3D11CreateDevice(
+                &dxgi_adapter,
+                D3D_DRIVER_TYPE_UNKNOWN,
+                HMODULE(std::ptr::null_mut()),
+                if cfg!(debug_assertions) {
+                    Direct3D11::D3D11_CREATE_DEVICE_DEBUG
+                } else {
+                    Direct3D11::D3D11_CREATE_DEVICE_FLAG(0)
+                },
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                Direct3D11::D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut device_context),
+            )
+        }?;
+        let device = device.unwrap();
+        let device_context = device_context.unwrap();
+
+        let swap_chain_desc = Dxgi::DXGI_SWAP_CHAIN_DESC {
+            BufferDesc: Dxgi::Common::DXGI_MODE_DESC {
+                Width: frame_width,
+                Height: frame_height,
+                Format: frame_format,
+                ..Dxgi::Common::DXGI_MODE_DESC::default()
+            },
+            SampleDesc: Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BufferUsage: Dxgi::DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 2,
+            OutputWindow: window,
+            Windowed: true.into(),
+            SwapEffect: Dxgi::DXGI_SWAP_EFFECT_DISCARD,
+            Flags: 0,
+        };
+
+        let mut swap_chain = None;
+        unsafe { dxgi_factory.CreateSwapChain(&device, &swap_chain_desc, &mut swap_chain) }.ok()?;
+        let swap_chain = swap_chain.unwrap();
+
+        unsafe { dxgi_factory.MakeWindowAssociation(window, Dxgi::DXGI_MWA_NO_ALT_ENTER) }?;
+        Ok((device, device_context, swap_chain))
+    }
+
+    fn create_render_target_for_swap_chain(
+        device: &Direct3D11::ID3D11Device,
+        swap_chain: &Dxgi::IDXGISwapChain,
+    ) -> Result<Direct3D11::ID3D11RenderTargetView> {
+        let swap_chain_texture = unsafe { swap_chain.GetBuffer::<Direct3D11::ID3D11Texture2D>(0) }?;
+        let mut render_target = None;
+        unsafe {
+            device.CreateRenderTargetView(&swap_chain_texture, None, Some(&mut render_target))
+        }?;
+        Ok(render_target.unwrap())
+    }
+
+    fn resize(&mut self, new_size: &PhysicalSize<u32>) {
+        if let Err(err) = self.resize_swap_chain_and_render_target(
+            new_size.width,
+            new_size.height,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+        ) {
+            panic!("Failed to resize framebuffers: {err:?}");
+        }
+    }
+
+    fn resize_swap_chain_and_render_target(
+        &mut self,
+        new_width: u32,
+        new_height: u32,
+        new_format: DXGI_FORMAT,
+    ) -> Result<()> {
+        self.render_target.take();
+        unsafe {
+            self.swap_chain.ResizeBuffers(
+                2,
+                new_width,
+                new_height,
+                new_format,
+                Dxgi::DXGI_SWAP_CHAIN_FLAG(0),
+            )
+        }?;
+        self.render_target
+            .replace(Self::create_render_target_for_swap_chain(
+                &self.device,
+                &self.swap_chain,
+            )?);
+        Ok(())
+    }
+
+    pub fn enable_multithread_protection(&mut self) -> Result<()> {
+        unsafe {
+            use windows::Win32::Graphics::Direct3D11::ID3D11Multithread;
+            // Query the multithread interface from the device context
+            let multithread: ID3D11Multithread = self.device_context.cast()?;
+            // Enable protection (this is the key!)
+            if multithread.SetMultithreadProtected(true).as_bool() {
+                self.multithread.replace(multithread);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for D3d11App {
+    fn drop(&mut self) {
+        for texure in self.tex_rgba.split_off(0) {
+            self.egui_renderer.unregister_user_texture(texure);
+        }
+    }
+}
+
+// #[derive(Default)]
+pub struct AppRunner {
+    pub running: Arc<AtomicBool>,
+    window: Option<Window>,
+    // window_attributes: WindowAttributes,
+
+    // pub gl: Option<glow::Context>,
+    // pub surface: Option<Surface<WindowSurface>>,
+    // pub context: Option<PossiblyCurrentContext>,
+    // pub program: Option<glow::Program>,
+    // pub vao: Option<glow::NativeVertexArray>,
+    // pub tex_rgb: Vec<glow::NativeTexture>,
+    d3d11_app: Option<D3d11App>,
+    resources: Vec<Box<dyn GluResource>>,
 
     pub last_op: Instant,
     pub sync_ctrl: Option<GluResourceCtrlSync>,
@@ -60,7 +412,7 @@ pub struct App {
     // pub onload: Box<dyn FnMut(HashMap<usize, CudaFrame>) -> Result<()> + Send + 'static>,
 }
 
-impl App {
+impl AppRunner {
     pub fn new(
         running: Arc<AtomicBool>,
         resources: Vec<Box<dyn GluResource>>,
@@ -68,13 +420,9 @@ impl App {
     ) -> Self {
         Self {
             running,
+            // window_attributes: WindowAttributes::default(),
             window: None,
-            gl: None,
-            surface: None,
-            context: None,
-            tex_rgb: vec![],
-            program: None,
-            vao: None,
+            d3d11_app: None,
             // frames: 0,
             // start_time: Instant::now(),
             resources,
@@ -114,7 +462,7 @@ impl App {
         }
     }
 }
-impl ApplicationHandler<UserEvent> for App {
+impl ApplicationHandler<UserEvent> for AppRunner {
     /// 在windows中gl drop和windows是绑定的，所以务必确保退出时即使反注册
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         for resource in &mut self.resources {
@@ -123,168 +471,31 @@ impl ApplicationHandler<UserEvent> for App {
     }
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window_attrs = WindowAttributes::default()
-            .with_title("NV12 CUDA/GL Demo")
+            .with_title("D3D11 CUDA Demo")
             .with_inner_size(PhysicalSize::new(WIDTH, HEIGHT));
-
-        let template = ConfigTemplateBuilder::new();
-        let display_builder = DisplayBuilder::new().with_window_attributes(Some(window_attrs));
-
-        let (window, gl_config) = display_builder
-            .build(event_loop, template, |mut configs| configs.next().unwrap())
-            .unwrap();
-
-        let window = window.unwrap();
-
-        #[allow(deprecated)]
-        let context_attributes = ContextAttributesBuilder::new()
-            // .with_context_api(ContextApi::Gles(Some(Version::new(3, 0))))
-            .build(window.raw_window_handle().ok());
-
-        let not_current = unsafe {
-            gl_config
-                .display()
-                .create_context(&gl_config, &context_attributes)
-                .unwrap()
-        };
-
-        let attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
-            #[allow(deprecated)]
-            window.raw_window_handle().expect("oops"),
-            NonZeroU32::new(WIDTH as u32).unwrap(),
-            NonZeroU32::new(HEIGHT as u32).unwrap(),
-        );
-
-        let surface = unsafe {
-            gl_config
-                .display()
-                .create_window_surface(&gl_config, &attrs)
-                .unwrap()
-        };
-        let context = not_current.make_current(&surface).unwrap();
-
-        surface
-            .set_swap_interval(
-                &context,
-                // SwapInterval::Wait(NonZeroU32::new(1).unwrap()), // VSync 开启
-                SwapInterval::DontWait, // 或关闭 VSync
-            )
-            .unwrap();
-
-        let gl = unsafe {
-            glow::Context::from_loader_function(|s| {
-                gl_config
-                    .display()
-                    .get_proc_address(&CString::new(s).unwrap())
-            })
-        };
-
-        for i in 0..self.resources.len() {
-            let Some(GluResourceStatInfo { width, height, .. }) = self.resources[i].get_info()
-            else {
-                continue;
-            };
-            // ---- textures ----
-            let tex_rgb = unsafe {
-                let t = gl.create_texture().unwrap();
-                gl.bind_texture(glow::TEXTURE_2D, Some(t));
-                gl.tex_image_2d(
-                    glow::TEXTURE_2D,
-                    0,
-                    glow::RGBA8 as i32,
-                    width as i32,
-                    height as i32,
-                    0,
-                    glow::RGBA,
-                    glow::UNSIGNED_BYTE,
-                    None,
-                );
-                gl.tex_parameter_i32(
-                    glow::TEXTURE_2D,
-                    glow::TEXTURE_MIN_FILTER,
-                    glow::LINEAR as i32,
-                );
-                gl.tex_parameter_i32(
-                    glow::TEXTURE_2D,
-                    glow::TEXTURE_MAG_FILTER,
-                    glow::LINEAR as i32,
-                );
-                gl.tex_parameter_i32(
-                    glow::TEXTURE_2D,
-                    glow::TEXTURE_WRAP_S,
-                    glow::CLAMP_TO_EDGE as i32,
-                );
-                gl.tex_parameter_i32(
-                    glow::TEXTURE_2D,
-                    glow::TEXTURE_WRAP_T,
-                    glow::CLAMP_TO_EDGE as i32,
-                );
-                t
-            };
-            // self.resources[i].stop();
-            // println!("app registering {} {}", tex_y.0.get(), tex_uv.0.get());
-            let _ = elogger!(self.resources[i].register(tex_rgb.0.get()));
-            // self.resources[i].start();
-            self.tex_rgb.push(tex_rgb);
-            // self.tex_uv.push(tex_uv);
-        }
-
-        let program = create_program(&gl);
-        // let vao = unsafe { gl.create_vertex_array().unwrap() };
-
-        let vao = unsafe {
-            let vao = gl.create_vertex_array().unwrap();
-            gl.bind_vertex_array(Some(vao));
-            // Vertex data: positions (x, y) and texture coordinates (u, v)
-            let vertices: [f32; 24] = [
-                // First triangle
-                -1.0, -1.0, 0.0, 1.0, // bottom-left
-                1.0, -1.0, 1.0, 1.0, // bottom-right
-                -1.0, 1.0, 0.0, 0.0, // top-left
-                // Second triangle
-                -1.0, 1.0, 0.0, 0.0, // top-left
-                1.0, -1.0, 1.0, 1.0, // bottom-right
-                1.0, 1.0, 1.0, 0.0, // top-right
-            ];
-
-            // Create and fill vertex buffer
-            let vbo = gl.create_buffer().unwrap();
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-            gl.buffer_data_u8_slice(
-                glow::ARRAY_BUFFER,
-                &vertices.align_to::<u8>().1,
-                glow::STATIC_DRAW,
-            );
-
-            // Set up vertex attributes
-            let stride = (4 * std::mem::size_of::<f32>()) as i32; // 4 floats per vertex
-
-            // Position attribute (location 0)
-            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
-            gl.enable_vertex_attrib_array(0);
-
-            // Texture coordinate attribute (location 1)
-            gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 8); // 2 floats offset
-            gl.enable_vertex_attrib_array(1);
-
-            // Cleanup
-            gl.bind_vertex_array(None);
-            gl.bind_buffer(glow::ARRAY_BUFFER, None);
-
-            vao
-        };
-
-        self.window = Some(window);
-        self.gl = Some(gl);
-        self.surface = Some(surface);
-        self.context = Some(context);
-        self.program = Some(program);
-        self.vao = Some(vao);
-        // self.cuda_y = cuda_y;
-        // self.cuda_uv = cuda_uv;
+        let window = event_loop
+            .create_window(window_attrs)
+            .expect("Failed to create window");
+        let mut demo_app = D3d11App::new(&window).expect("Fail to create demo app");
+        let _ = demo_app
+            .enable_multithread_protection()
+            .expect("Enabling multithread protection failed");
+        demo_app
+            .create_textures(&mut self.resources)
+            .expect("Texture creating error");
+        self.d3d11_app.replace(demo_app);
+        self.window.replace(window);
 
         if let Some(sync_ctrl) = &mut self.sync_ctrl {
             let _ = elogger!(sync_ctrl.start());
         }
+    }
+    fn suspended(&mut self, _: &ActiveEventLoop) {
+        for resource in &mut self.resources {
+            let _ = elogger!(resource.unregister());
+        }
+        self.d3d11_app.take();
+        self.window.take();
     }
 
     // fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -343,8 +554,19 @@ impl ApplicationHandler<UserEvent> for App {
                     self.handle_key_press(key_code, event_loop);
                 }
             }
+            WindowEvent::Resized(new_size) => {
+                if let Some(d3d11_app) = &mut self.d3d11_app {
+                    d3d11_app.resize(&new_size);
+                }
+            }
             WindowEvent::RedrawRequested => {
+                let Some(window) = &self.window else {
+                    return;
+                };
                 let Some(sync_ctrl) = &mut self.sync_ctrl else {
+                    return;
+                };
+                let Some(d3d11_app) = &mut self.d3d11_app else {
                     return;
                 };
                 let Some(data) = sync_ctrl.load_frames() else {
@@ -356,97 +578,17 @@ impl ApplicationHandler<UserEvent> for App {
                     //     .unwrap();
                     return;
                 };
+                d3d11_app.multithread_enter();
                 for i in 0..self.resources.len() {
                     let _ = elogger!(self.resources[i].draw(data.get(&i)));
                 }
+                d3d11_app.multithread_leave();
+
                 let pts = data.iter().find(|_| true).map(|(_, v)| v.pts).unwrap();
                 let _ = elogger!(sync_ctrl.recycle(data));
 
-                let gl = self.gl.as_ref().unwrap();
-                unsafe {
-                    gl.clear_color(0.1, 0.1, 0.1, 1.0);
-                    gl.clear(glow::COLOR_BUFFER_BIT);
-
-                    gl.use_program(self.program);
-
-                    if let Some(program) = self.program {
-                        let loc_rgb = gl.get_uniform_location(program, "tex_rgb");
-                        // let loc_uv = gl.get_uniform_location(program, "tex_uv");
-
-                        gl.uniform_1_i32(loc_rgb.as_ref(), 0);
-                        // gl.uniform_1_i32(loc_uv.as_ref(), 1);
-                    }
-
-                    // 去掉toolbar影响
-                    let window = self.window.as_ref().unwrap();
-                    let size = window.inner_size();
-                    let inner_width = size.width as i32;
-                    let inner_height = size.height as i32;
-
-                    let matrix = (self.resources.len() as f32).sqrt().ceil() as usize;
-
-                    let grid_cols = matrix as i32;
-                    let grid_rows = matrix as i32;
-                    let cell_width = inner_width / grid_cols;
-                    let cell_height = inner_height / grid_rows;
-
-                    for col in 0..grid_cols {
-                        for row in 0..grid_rows {
-                            let offset = (row + col * grid_cols) as usize;
-                            // println!(
-                            //     " sync_ctrl.resource_infos {:?} {offset}",
-                            //     sync_ctrl.resource_infos.keys()
-                            // );
-                            let Some((w, h)) = sync_ctrl
-                                .resource_infos
-                                .get(&offset)
-                                .map(|v| (v.width as i32, v.height as i32))
-                            else {
-                                // println!("oops {offset}");
-                                continue;
-                            };
-                            // log::warn!("drawing {offset}");
-                            let x = row * cell_width;
-                            let y = (grid_cols - col - 1) * cell_height;
-                            let width = cell_width;
-                            let height = cell_height;
-                            if offset < self.tex_rgb.len() {
-                                // if cell_width * h > cell_height * w {
-                                //     let cell_width_new = cell_height * w / h;
-                                //     x += (cell_width - cell_width_new) / 2;
-                                //     width = cell_width_new;
-                                // } else {
-                                //     let cell_height_new = cell_width * h / w;
-                                //     y -= (cell_height - cell_height_new) / 2;
-                                //     height = cell_height_new;
-                                // }
-                                gl.viewport(x, y, width, height);
-                                gl.active_texture(glow::TEXTURE0);
-                                gl.bind_texture(glow::TEXTURE_2D, Some(self.tex_rgb[offset]));
-
-                                // gl.active_texture(glow::TEXTURE1);
-                                // gl.bind_texture(glow::TEXTURE_2D, Some(self.tex_uv[offset]));
-
-                                gl.bind_vertex_array(self.vao);
-                                gl.draw_arrays(glow::TRIANGLES, 0, 6);
-                            }
-                        }
-                    }
-                    log::debug!("[App]drawing done for <{pts}>",);
-                }
-
-                // let _ = elogger!(sync_ctrl.recycle(frames));
-                // unsafe {
-                //     gl.flush();
-                //     gl.finish();
-                // }
-                self.surface
-                    .as_ref()
-                    .unwrap()
-                    .swap_buffers(self.context.as_ref().unwrap())
-                    .unwrap();
-
-                // self.window.as_ref().unwrap().request_redraw();
+                d3d11_app.render(window);
+                log::debug!("[App]drawing done for <{pts}>",);
             }
             _ => {}
         }
@@ -522,7 +664,7 @@ void main() {
 pub trait GluResource {
     fn set_id(&mut self, id: usize);
     fn get_id(&self) -> usize;
-    fn register(&mut self, tex_rgb_id: u32) -> Result<()>;
+    fn register(&mut self, tex_rgba_id: *mut std::ffi::c_void) -> Result<()>;
     fn unregister(&mut self) -> Result<()>;
     fn start(&mut self) -> Result<()>;
     fn stop(&self) -> Result<()>;
@@ -854,354 +996,6 @@ impl GluResourceCtrlSync {
             }
             log::info!("Quitting GluResourceCtrlSync Align Thread");
         });
-        // let audio_opt = if has_audio {
-        //     let Some(samplerate) = samplerate else {
-        //         return Err(anyhow!("SampleRate for audio is not set"));
-        //     };
-        //     let (sample_sndr, sample_rcvr) = std::sync::mpsc::channel();
-        //     let streamer = utils::make_stream(sample_rcvr)?;
-        //     streamer.stream.play()?;
-        //     audio_streamer.replace(Arc::new(streamer));
-        //     Some((sample_sndr, samplerate))
-        // } else {
-        //     None
-        // };
-        // std::thread::spawn(move || {
-        //     let mut start_time = None;
-        //     let mut pause_time = None;
-        //     let mut start_pts = None;
-        //     let mut frames = 0;
-        //     let mut cache = vec![];
-        //     let frame_duration = (1000f64 / framerate1) as u64;
-        //     // let default_audio_duration = (AUDIO_SAMPLES * 1000 / *samplerate as usize / 10) * 10;
-        //     'outer: loop {
-        //         // log::debug!("[debug] audio spin");
-        //         let mut local_state = GluResourceState::Pause;
-        //         // 检查状态
-        //         if Self::peek_state(&mut local_state, &state1) {
-        //             break;
-        //         }
-        //         // 如果是暂停则进入selfspin状态，为防止过度自旋，加了一个100ms的等待
-        //         if local_state == GluResourceState::Pause {
-        //             if pause_time.is_none() {
-        //                 pause_time.replace(Instant::now());
-        //             }
-        //             std::thread::sleep(Duration::from_millis(200));
-        //             continue;
-        //         }
-        //         // 如果非stop/pause状态，则需保证start_time存在
-        //         if start_time.is_none() {
-        //             start_time.replace(Instant::now());
-        //         } else if let Some(start_time) = &mut start_time
-        //             && let Some(pause_time) = pause_time.take()
-        //         {
-        //             *start_time += pause_time.elapsed();
-        //         }
-        //         let start_time1 = start_time.as_mut().unwrap();
-
-        //         let wait_time = if let Some((sample_sndr, samplerate)) = &audio_opt {
-        //             while let Ok(v) = audio_rcvr.try_recv() {
-        //                 cache.push(v);
-        //             }
-        //             // log::debug!(
-        //             //     "[debug][audio] cache state {:?}",
-        //             //     cache
-        //             //         .iter()
-        //             //         .map(|v| (v.pts, v.data.len()))
-        //             //         .collect::<Vec<_>>()
-        //             // );
-        //             let default_audio_duration =
-        //                 (AUDIO_SAMPLES * 1000 / *samplerate as usize / 10) * 10;
-        //             let Ok(time) = Self::tick_samples(
-        //                 start_time1,
-        //                 &mut start_pts,
-        //                 &mut cache,
-        //                 &mut frames,
-        //                 &sample_sndr,
-        //                 default_audio_duration,
-        //             ) else {
-        //                 continue 'outer;
-        //             };
-        //             if time > 0 {
-        //                 // Some(Duration::from_millis(default_audio_duration as u64))
-        //                 Some(Duration::from_millis(
-        //                     std::cmp::max(time, default_audio_duration) as u64,
-        //                 ))
-        //             } else {
-        //                 None
-        //             }
-        //         } else {
-        //             Some(Duration::from_millis(frame_duration / 2))
-        //         };
-
-        //         Self::tick_frames(*start_time1, &mut frames, &vidx_sndr, framerate1);
-
-        //         if let Some(t) = wait_time {
-        //             // cache.iter().map(|v| v.pts).collect()
-        //             // log::debug!("[Audio] sync waiting {}ms", t.as_millis(),);
-        //             std::thread::sleep(t);
-        //         }
-        //     }
-        //     log::info!("Quitting GluResourceCtrlSync Audio Thread");
-        // });
-        // if has_audio {
-        //     let Some(_samplerate) = samplerate else {
-        //         return Err(anyhow!("SampleRate for audio is not set"));
-        //     };
-        //     let (sample_sndr, sample_rcvr) = std::sync::mpsc::channel();
-        //     let streamer = utils::make_stream(sample_rcvr)?;
-        //     streamer.play()?;
-        //     audio_streamer.replace(Arc::new(streamer));
-
-        //     std::thread::spawn(move || {
-        //         let mut start_time = None;
-        //         let mut pause_time = None;
-        //         let mut frames = 0;
-        //         let mut cache = vec![];
-        //         'outer: loop {
-        //             let mut local_state = GluResourceState::Pause;
-        //             // 检查状态
-        //             if Self::peek_state(&mut local_state, &state1) {
-        //                 break;
-        //             }
-        //             // 如果是暂停则进入selfspin状态，为防止过度自旋，加了一个100ms的等待
-        //             if local_state == GluResourceState::Pause {
-        //                 if pause_time.is_none() {
-        //                     pause_time.replace(Instant::now());
-        //                 }
-        //                 std::thread::sleep(Duration::from_millis(100));
-        //                 continue;
-        //             }
-        //             // 如果非stop/pause状态，则需保证start_time存在
-        //             if start_time.is_none() {
-        //                 start_time.replace(Instant::now());
-        //             } else if let Some(start_time) = &mut start_time
-        //                 && let Some(pause_time) = pause_time.take()
-        //             {
-        //                 *start_time += pause_time.elapsed();
-        //             }
-        //             let start_time1 = start_time.as_mut().unwrap();
-
-        //             while let Ok(v) = audio_rcvr.try_recv() {
-        //                 cache.push(v);
-        //             }
-
-        //             let Ok(should_wait) = Self::tick_samples(start_time1, &mut cache, &sample_sndr)
-        //             else {
-        //                 continue 'outer;
-        //             };
-        //             Self::tick_frames(
-        //                 *start_time1,
-        //                 &mut frames,
-        //                 &vidx_sndr,
-        //                 total_frames,
-        //                 framerate1,
-        //             );
-        //             if should_wait {
-        //                 std::thread::sleep(Duration::from_millis(20));
-        //             }
-        //         }
-        //         log::info!("Quitting GluResourceCtrlSync Audio Thread");
-        //     });
-        // } else {
-        //     std::thread::spawn(move || {
-        //         let mut start_time = None;
-        //         let mut pause_time = None;
-        //         let mut frames = 0;
-        //         let frame_duration = (1000f64 / framerate1) as u64;
-        //         loop {
-        //             let mut local_state = GluResourceState::Pause;
-        //             // 检查状态
-        //             if Self::peek_state(&mut local_state, &state1) {
-        //                 break;
-        //             }
-        //             // 如果是暂停则进入selfspin状态，为防止过度自旋，加了一个100ms的等待
-        //             if local_state == GluResourceState::Pause {
-        //                 if pause_time.is_none() {
-        //                     pause_time.replace(Instant::now());
-        //                 }
-        //                 std::thread::sleep(Duration::from_millis(100));
-        //                 continue;
-        //             }
-        //             // 如果非stop/pause状态，则需保证start_time存在
-        //             if start_time.is_none() {
-        //                 start_time.replace(Instant::now());
-        //             } else if let Some(start_time) = &mut start_time
-        //                 && let Some(pause_time) = pause_time.take()
-        //             {
-        //                 *start_time += pause_time.elapsed();
-        //             }
-        //             let start_time1 = start_time.unwrap();
-        //             Self::tick_frames(
-        //                 start_time1,
-        //                 &mut frames,
-        //                 &vidx_sndr,
-        //                 total_frames,
-        //                 framerate1,
-        //             );
-        //             std::thread::sleep(Duration::from_millis(frame_duration / 2));
-        //         }
-        //         log::info!("Quitting GluResourceCtrlSync Sync Thread");
-        //     });
-        // }
-
-        // let ready_sndrs1 = ready_sndrs.clone();
-        // let decode_rcvrs1 = decode_rcvrs.clone();
-        // let resource_infos1 = resource_infos.clone();
-        // // let nppi_ctx1 = Arc::new(nppi_ctx);
-        // std::thread::spawn(move || {
-        //     let frame_duration = (1000f64 / framerate1) as u64;
-        //     // 预存cuda_frame，用于打开解码线程的阻塞器开关，让CHANNEL_SIZE左右个帧加入到缓存队列中
-        //     for (i, ready_sndr) in &ready_sndrs1 {
-        //         if let Some(info) = resource_infos1.get(&i) {
-        //             for _ in 0..CHANNEL_SIZE {
-        //                 if let Ok(cuda_frame) = elogger!(CudaFrame::new(info.width, info.height)) {
-        //                     let _ = ready_sndr.send_timeout(cuda_frame, Duration::from_secs(10));
-        //                 }
-        //             }
-        //         }
-        //     }
-        //     let mut datas: HashMap<usize, Vec<CudaFrame>> = HashMap::new();
-        //     let mut local_state = GluResourceState::Pause;
-        //     // let mut previous_idx = None;
-        //     let start_time = Instant::now();
-        //     let mut frames = 0;
-        //     'outer: loop {
-        //         // log::debug!("[debug] video spin");
-        //         // let timeout = Duration::from_secs(20);
-        //         // 检查状态位
-        //         if Self::peek_state(&mut local_state, &state2) {
-        //             break;
-        //         }
-        //         // 确保回收队列为空，便于释放解码器线程的阻塞状态
-        //         // while let Ok(recyled) = sync_hook_rcvr.try_recv() {
-        //         //     for (i, cuda_frame) in recyled.into_iter() {
-        //         //         if let Some(ready_sndr) = ready_sndrs1.get(&i) {
-        //         //             let _ = ready_sndr.send_timeout(cuda_frame, Duration::from_secs(10));
-        //         //         }
-        //         //     }
-        //         // }
-        //         // 尝试从解码线程中获取帧数据，确保所有解码数据进入缓存
-        //         // log::debug!("[App] receiving local_state {local_state:?}");
-        //         for (i, decode_rcvr) in &decode_rcvrs1 {
-        //             while let Ok(v) = decode_rcvr.try_recv() {
-        //                 if let Some(list) = datas.get_mut(i) {
-        //                     list.push(v);
-        //                 } else {
-        //                     datas.insert(*i, vec![v]);
-        //                 }
-        //             }
-        //         }
-        //         // log::debug!("[App][Video]peeking {previous_idx:?}",);
-        //         // let vidx_opt = if previous_idx.is_some() {
-        //         //     previous_idx
-        //         // } else {
-
-        //         // };
-        //         let is_ready = datas.iter().any(|(_, v)| v.len() > CHANNEL_SIZE / 2);
-        //         // 尝试获取同步指令，如果所有视频的缓存都大于一半以上，说明当前处理较快，可以阻塞性等待同步指令
-        //         let vidx_opt = if is_ready {
-        //             match vidx_rcvr.recv_timeout(Duration::from_secs(1)) {
-        //                 Ok(v) => Some(v),
-        //                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-        //                     continue;
-        //                 }
-        //                 _ => None,
-        //             }
-        //         } else {
-        //             match vidx_rcvr.try_recv() {
-        //                 Ok(v) => Some(v),
-        //                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-        //                     continue;
-        //                 }
-        //                 _ => None,
-        //             }
-        //         };
-        //         // log::debug!("[debug] validating datas datas {vidx_opt:?} {datas:?}");
-        //         if datas.is_empty() || datas.values().find(|v| v.len() == 0).is_some() {
-        //             std::thread::sleep(Duration::from_millis(frame_duration / 2));
-
-        //             continue;
-        //         }
-        //         let Some(indexer) = vidx_opt else {
-        //             std::thread::sleep(Duration::from_millis(frame_duration / 2));
-        //             continue;
-        //         };
-        //         // log::debug!(
-        //         //     "[App][Video]Index {} received pts {} datas {datas:?}",
-        //         //     indexer.index,
-        //         //     indexer.pts
-        //         // );
-
-        //         let collected =
-        //             Self::collect_frames(indexer, total_frames, &mut datas, &ready_sndrs1);
-        //         if collected.len() == 0 {
-        //             // 如果收集不到数据且最早的idx晚于当前indexer，说明缓存数据尚不
-        //             // if let Some(min_idx) = Self::earlist_idx(total_frames, &datas) {
-        //             //     if indexer.earlier(&min_idx, total_frames) {
-        //             //         previous_idx.replace(indexer);
-        //             //     }
-        //             // }
-        //             std::thread::sleep(Duration::from_millis(frame_duration / 2));
-        //             continue;
-        //         }
-        //         // previous_idx.take();
-        //         // log::debug!(
-        //         //     "[App][Video]Index {} received pts {} collected {:?}",
-        //         //     indexer.index,
-        //         //     indexer.pts,
-        //         //     collected
-        //         // );
-        //         // 发送同步队列前，确保所有cuda操作都结束，阻塞行为
-        //         // cuda_check!(
-        //         //     cudaStreamSynchronize(nppi_ctx1.hStream),
-        //         //     "GluResourceCtrlSync cudaStreamSynchronize Err"
-        //         // );
-        //         for data in collected {
-        //             // if elogger!(onload(data)).is_err() {
-        //             //     break 'outer;
-        //             // }
-        //             match sync_sndr.try_send(data) {
-        //                 Ok(_) => {}
-        //                 Err(crossbeam::channel::TrySendError::Full(mut dump)) => {
-        //                     for (i, ready_sndr) in &ready_sndrs1 {
-        //                         if let Some(cuda_frame) = dump.remove(i) {
-        //                             let _ = ready_sndr
-        //                                 .send_timeout(cuda_frame, Duration::from_secs(10));
-        //                         }
-        //                     }
-        //                 }
-        //                 Err(_) => {
-        //                     break 'outer;
-        //                 }
-        //             }
-        //         }
-        //         if frames % 100 == 0 {
-        //             let fps = frames * 1000 / start_time.elapsed().as_millis() as usize;
-        //             log::info!("[App] frames fps is {fps:.4}");
-        //         }
-        //         frames += 1;
-
-        //         // for (i, syn_sndr) in &syn_sndrs {
-        //         //     'inner1: loop {
-        //         //         if Self::peek_state(&mut local_state, &state1) {
-        //         //             break 'outer;
-        //         //         }
-        //         //         if local_state != GluResourceState::Pause {
-        //         //             break 'inner1;
-        //         //         }
-        //         //         std::thread::sleep(Duration::from_millis(100));
-        //         //     }
-        //         //     if let Some(cuda_frame) = datas.remove(&i) {
-        //         //         if elogger!(syn_sndr.send_timeout(cuda_frame, timeout)).is_err() {
-        //         //             break 'outer;
-        //         //         }
-        //         //     }
-        //         // }
-        //     }
-
-        //     log::info!("Quitting GluResourceCtrlSync Video Thread");
-        // });
 
         Ok(Self {
             ready_sndrs,
@@ -1345,357 +1139,6 @@ impl GluResourceCtrlSync {
         }
         datas
     }
-    /// 处理一片音频，如果处理时时间轴>
-    // fn process_samples(
-    //     start_time: Instant,
-    //     audio_data: Option<&GluAudioData>,
-    //     sample_sndr: &std::sync::mpsc::Sender<Vec<f32>>,
-    //     // index: &Arc<AtomicU64>,
-    //     frames: &mut usize,
-    //     vidx_sndr: &std::sync::mpsc::Sender<GluVideoIndex>,
-    //     total_frames: usize,
-    //     framerate: f64,
-    // ) -> Result<bool> {
-    //     let local_pts = start_time.elapsed().as_millis() as i64;
-    //     if let Some(ad) = audio_data {
-    //         if local_pts < ad.pts {
-    //             // std::thread::sleep(Duration::from_millis((ad.pts - local_pts) as u64 / 2));
-    //             return Ok(false);
-    //         }
-    //         // let frame_duration = (1000f64 / framerate) as u64;
-    //         let samples = bytemuck::cast_slice::<u8, f32>(&ad.data)
-    //             .into_iter()
-    //             .map(|v| *v)
-    //             .collect::<Vec<f32>>();
-    //         let _ = elogger!(sample_sndr.send(samples))?;
-    //     }
-    //     let should_play_idx = std::cmp::max(
-    //         OrderedFloat(local_pts as f64 * framerate / 1000f64),
-    //         OrderedFloat(0f64),
-    //     )
-    //     .round() as usize
-    //         % total_frames;
-    //     if should_play_idx != *frames {
-    //         // log::debug!(
-    //         //     "[debug][align]sending {} idx {should_play_idx} {local_pts}",
-    //         //     audio_data.is_some()
-    //         // );
-    //         let _ = vidx_sndr.send(GluVideoIndex::new(should_play_idx, local_pts));
-    //         *frames = should_play_idx;
-    //         return Ok(true);
-    //     }
-    //     Ok(false)
-    // }
-
-    /// 处理一片音频，如果处理时时间轴>
-    // fn tick_samples(
-    //     start_time: &mut Instant,
-    //     start_pts: &mut Option<i64>,
-    //     cache: &mut Vec<GluAudioData>,
-    //     frames: &mut usize,
-    //     sample_sndr: &std::sync::mpsc::Sender<Vec<f32>>,
-    //     default_duration: usize,
-    // ) -> Result<usize> {
-    //     // let mut should_wait = false;
-    //     let local_pts = start_time.elapsed().as_millis() as i64;
-    //     if cache.len() == 0 {
-    //         // log::debug!("[debug][audio] empty cache",);
-    //         return Ok(default_duration);
-    //     }
-    //     if cache[0].data.len() == 0 {
-    //         *start_time = Instant::now();
-    //         // log::debug!(
-    //         //     "[debug][audio] resetting audio time cache {:?}",
-    //         //     cache
-    //         //         .iter()
-    //         //         .map(|v| (v.pts, v.data.len()))
-    //         //         .collect::<Vec<_>>()
-    //         // );
-    //         cache.remove(0);
-    //         start_pts.take();
-    //         *frames = 0;
-    //         return Ok(0);
-    //     }
-
-    //     // 尽可能发送更多的采样
-    //     while cache.len() > 0 {
-    //         let audio_data = &cache[0];
-    //         if start_pts.is_none() {
-    //             start_pts.replace(audio_data.pts);
-    //         }
-    //         let actual_pts = audio_data.pts - start_pts.unwrap_or(0);
-    //         if local_pts >= actual_pts {
-    //             let samples = bytemuck::cast_slice::<u8, f32>(&audio_data.data)
-    //                 .into_iter()
-    //                 .map(|v| *v)
-    //                 .collect::<Vec<f32>>();
-    //             let _ = elogger!(sample_sndr.send(samples))?;
-    //             // log::debug!(
-    //             //     "[debug][audio] local_pts {local_pts} actual_pts {actual_pts}  audio_data.pts {} start_pts {:?}",
-    //             //     audio_data.pts,
-    //             //     start_pts
-    //             // );
-    //             cache.remove(0);
-    //         } else {
-    //             // log::debug!("[debug][audio] waiting {local_pts} actual_pts {actual_pts}",);
-    //             return Ok((actual_pts - local_pts) as usize);
-    //         }
-    //     }
-    //     Ok(0)
-    // }
-    // /// 处理一片音频，如果处理时时间轴>
-    // fn tick_frames(
-    //     start_time: Instant,
-    //     // index: &Arc<AtomicU64>,
-    //     frames: &mut usize,
-    //     vidx_sndr: &std::sync::mpsc::Sender<GluVideoIndex>,
-    //     framerate: f64,
-    // ) {
-    //     let local_pts = start_time.elapsed().as_millis() as i64;
-    //     // let factor = if *frames < 20 { 10f64 } else { 1f64 };
-    //     let should_play_idx = std::cmp::max(
-    //         OrderedFloat(local_pts as f64 * framerate / 1000f64),
-    //         OrderedFloat(0f64),
-    //     )
-    //     .round() as usize;
-
-    //     // let mut wait_time = None;
-    //     // let idx = GluVideoIndex::new(should_play_idx, local_pts);
-    //     // if let Ok(idx) = elogger!(idx.pack_compact()) {
-    //     //     let current = index.load(Ordering::Relaxed);
-    //     //     if current != idx {
-    //     //         index.store(idx, Ordering::Release);
-    //     //         // let mut gap = (current as i128 - idx as i128).abs() as u64;
-    //     //         // 环形，如果是边缘处，则有如下特征
-    //     //         // if gap > total_frames as u64 / 2 {
-    //     //         //     gap = total_frames as u64 - gap;
-    //     //         // }
-    //     //         // wait_time.replace(Duration::from_millis(gap));
-    //     //     }
-    //     // }
-    //     if should_play_idx != *frames {
-    //         // let idx = GluVideoIndex::new(should_play_idx, local_pts);
-    //         // if let Ok(idx) = elogger!(idx.pack_compact()) {
-    //         //     index.store(idx, Ordering::Relaxed);
-    //         // }
-    //         // index.store(idx.pack_compact(), Ordering::Relaxed);
-    //         let _ = vidx_sndr.send(GluVideoIndex::new(should_play_idx, local_pts));
-    //         // log::debug!("[debug][video] local_pts {local_pts} should_play_idx {should_play_idx}",);
-    //         *frames = should_play_idx;
-    //         // log::debug!(
-    //         //     "[debug]tick_frameing {local_pts} framerate {framerate} total_frames {total_frames} should_play_idx {should_play_idx}",
-    //         // );
-    //     }
-    //     // let wait_time = wait_time.unwrap_or_else(|| {
-    //     //     let frame_duration = (1000f64 / framerate) as u64;
-    //     //     Duration::from_millis(frame_duration / 2)
-    //     // });
-    //     // if should_play_idx > *frames {
-    //     //     if let Ok(idx) = elogger!(idx.pack_compact()) {
-    //     //         index.compare_exchange(*frames as u64, idx, Ordering::Relaxed);
-    //     //     }
-    //     //     *frames = should_play_idx;
-    //     //     std::thread::sleep(Duration::from_millis(10));
-    //     // } else {
-    //     //     let frame_duration = (1000f64 / framerate) as u64;
-    //     //     std::thread::sleep(Duration::from_millis(frame_duration / 2));
-    //     //     return Ok(false);
-    //     // }
-    //     // Ok(true)
-    // }
-
-    /// 尝试获取最早的帧并对齐，直到找到idx位置的帧
-    // fn collect_frames1(
-    //     indexer: GluVideoIndex,
-    //     total_frames: usize,
-    //     cache: &mut HashMap<usize, Vec<CudaFrame>>,
-    //     ready_sndrs: &HashMap<usize, crossbeam::channel::Sender<CudaFrame>>,
-    // ) -> Vec<HashMap<usize, CudaFrame>> {
-    //     let mut datas = vec![];
-    //     let nb_frames = ready_sndrs.len();
-    //     loop {
-    //         if cache.len() != nb_frames {
-    //             break;
-    //         }
-    //         let Some(min_idx) = Self::earlist_idx(total_frames, cache) else {
-    //             break;
-    //         };
-    //         // if cache.values().find(|v| v.len() == 0).is_some() {
-    //         //     break;
-    //         // }
-    //         // let order_idx = cache
-    //         //     .values()
-    //         //     .filter(|v| v.len() > 0 && v[0].idx.is_some())
-    //         //     .map(|v| v[0].idx.unwrap())
-    //         //     .map(|v| {
-    //         //         let new_value = if v.index < total_frames / 2 {
-    //         //             v.index + total_frames / 2
-    //         //         } else {
-    //         //             v.index
-    //         //         };
-    //         //         (new_value, v)
-    //         //     })
-    //         //     .collect::<Vec<(usize, GluVideoIndex)>>();
-    //         // let (_, min_idx) = order_idx.into_iter().min_by(|a, b| a.0.cmp(&b.0)).unwrap();
-    //         // log::debug!("[debug] comparing indexer {indexer:?} vs min_idx {min_idx:?} ");
-    //         if indexer.earlier(&min_idx, total_frames) && min_idx.index > 1 {
-    //             break;
-    //         }
-    //         // log::debug!("[debug] indexer {indexer:?} later than min_idx {min_idx:?} ");
-    //         if cache.iter().any(|(_, v)| {
-    //             let cuda_frame_idx = v[0].idx.unwrap();
-    //             cuda_frame_idx.index == min_idx.index
-    //         }) {
-    //             let mut items = HashMap::new();
-    //             for (k, cuda_frames) in cache.iter_mut() {
-    //                 // 这里认为所有的cuda_frame idx都不为空
-    //                 let cuda_frame_idx = cuda_frames[0].idx.unwrap();
-    //                 // 如果当前帧和最早帧号不匹配，该帧一定晚于最早帧号，所以会被忽略等待下一次轮训
-    //                 if cuda_frame_idx.index == min_idx.index {
-    //                     items.insert(*k, cuda_frames.remove(0));
-    //                 }
-    //             }
-    //             let items_len = items.len();
-    //             // 如果收集齐了，则放入返回队列，否则直接回收
-    //             if items_len == nb_frames {
-    //                 datas.push(items);
-    //             } else {
-    //                 for (k, v) in items {
-    //                     if let Some(ready_sndr) = ready_sndrs.get(&k) {
-    //                         let _ = ready_sndr.send_timeout(v, Duration::from_secs(10));
-    //                     }
-    //                 }
-    //                 if items_len == 0 {
-    //                     break;
-    //                 }
-    //             }
-    //         }
-    //         // for (k, cuda_frames) in cache.iter_mut() {
-    //         //     // 这里认为所有的cuda_frame idx都不为空
-    //         //     let cuda_frame_idx = cuda_frames[0].idx.unwrap();
-    //         //     // 如果当前帧和最早帧号不匹配，该帧一定晚于最早帧号，所以会被忽略等待下一次轮训
-    //         //     if cuda_frame_idx.index == min_idx.index {
-    //         //         items.insert(*k, cuda_frames.remove(0));
-    //         //     }
-    //         //     // else if let Some(ready_sndr) = ready_sndrs.get(k) {
-    //         //     //     let _ = ready_sndr.send_timeout(cuda_frame, Duration::from_secs(10));
-    //         //     // }
-    //         // }
-    //     }
-    //     datas
-
-    //     // // 取得滑动窗口内最早的帧号，默认视频不能太小，多个视频帧收集上来时，窗口不会相差1/2个total_frames，以这个为前提，获取1/2个total_frames内最小的那个值
-    //     // let order_idx = idxs
-    //     //     .iter()
-    //     //     .map(|v| {
-    //     //         let new_value = if *v < total_frames / 2 {
-    //     //             *v + total_frames / 2
-    //     //         } else {
-    //     //             *v
-    //     //         };
-    //     //         (new_value, *v)
-    //     //     })
-    //     //     .collect::<Vec<(usize, usize)>>();
-    //     // let (_, mut min_idx) = order_idx.into_iter().min_by(|a, b| a.0.cmp(&b.0)).unwrap();
-    //     // let mut datas = vec![];
-    //     // let nb_frames = cache.len();
-    //     // loop {
-    //     //     if indexer < min_idx {
-    //     //         break;
-    //     //     }
-    //     //     // 如果同步帧号 晚于 最早帧号，表示解码帧已经
-    //     //     // if GluVideoIndex::earlier(indexer.index, min_idx, total_frames) {
-    //     //     //     break;
-    //     //     // }
-    //     //     let mut items = HashMap::new();
-    //     //     for (k, v) in cache.iter_mut() {
-    //     //         let cuda_frame = v.remove(0);
-    //     //         // 如果当前帧和最小帧号部匹配，则直接回收，否则放入缓存队列
-    //     //         if cuda_frame.idx.unwrap_or(0) == min_idx {
-    //     //             items.insert(*k, cuda_frame);
-    //     //         } else if let Some(ready_sndr) = ready_sndrs.get(k) {
-    //     //             let _ = ready_sndr.send_timeout(cuda_frame, Duration::from_secs(10));
-    //     //         }
-    //     //     }
-    //     //     // 如果收集齐了，则放入返回队列，否则回收
-    //     //     if items.len() == nb_frames {
-    //     //         datas.push(items);
-    //     //     } else {
-    //     //         for (k, v) in items {
-    //     //             if let Some(ready_sndr) = ready_sndrs.get(&k) {
-    //     //                 let _ = ready_sndr.send_timeout(v, Duration::from_secs(10));
-    //     //             }
-    //     //         }
-    //     //         min_idx += 1;
-    //     //     }
-    //     // }
-    //     // datas
-    //     // 投票加权找到多数的帧号
-    //     // let mut voter = HashMap::new();
-    //     // for idx in &idxs {
-    //     //     if let Some(v) = voter.get_mut(idx) {
-    //     //         *v += 1;
-    //     //     } else {
-    //     //         voter.insert(*idx, 1);
-    //     //     }
-    //     // }
-    //     // let most_votes = voter.values().map(|v| *v).max().unwrap_or(0);
-    //     // // 如果投票帧的票数为1表示所有帧号都不相同，也就是乱序了，这时就取最小的
-    //     // let voted_idx = if most_votes == 1 {
-    //     //     let order_idx = idxs
-    //     //         .iter()
-    //     //         .map(|v| {
-    //     //             let new_value = if *v < total_frames / 2 {
-    //     //                 *v + total_frames / 2
-    //     //             } else {
-    //     //                 *v
-    //     //             };
-    //     //             (new_value, *v)
-    //     //         })
-    //     //         .collect::<Vec<(usize, usize)>>();
-    //     //     let (_, min_idx) = order_idx.into_iter().min_by(|a, b| a.0.cmp(&b.0)).unwrap();
-    //     //     min_idx
-    //     // } else {
-    //     //     voter
-    //     //         .into_iter()
-    //     //         .find(|(_, v)| *v == most_votes)
-    //     //         .map(|(k, _)| k)
-    //     //         .unwrap()
-    //     // };
-
-    //     // for (i, list) in cache {
-    //     //     // let min_idx = list.iter().fold((usize::MAX, 0), |(min, max), f| {
-    //     //     //     (
-    //     //     //         std::cmp::min(min, f.idx.unwrap_or(usize::MAX)),
-    //     //     //         std::cmp::min(v, f.idx.unwrap_or(usize::MAX)),
-    //     //     //     )
-    //     //     // });
-    //     // }
-    // }
-    // /// 获取缓存中最早的帧号
-    // fn earlist_idx(
-    //     total_frames: usize,
-    //     cache: &HashMap<usize, Vec<CudaFrame>>,
-    // ) -> Option<GluVideoIndex> {
-    //     if cache.is_empty() || cache.values().find(|v| v.len() == 0).is_some() {
-    //         return None;
-    //     }
-    //     let order_idx = cache
-    //         .values()
-    //         .filter(|v| v.len() > 0 && v[0].idx.is_some())
-    //         .map(|v| v[0].idx.unwrap())
-    //         .map(|v| {
-    //             let new_value = if v.index < total_frames / 2 {
-    //                 v.index + total_frames / 2
-    //             } else {
-    //                 v.index
-    //             };
-    //             (new_value, v)
-    //         })
-    //         .collect::<Vec<(usize, GluVideoIndex)>>();
-    //     let (_, min_idx) = order_idx.into_iter().min_by(|a, b| a.0.cmp(&b.0)).unwrap();
-    //     Some(min_idx)
-    // }
     fn earlist_pts(
         total_duration: i64,
         video_cache: &HashMap<usize, Vec<CudaFrame>>,

@@ -25,6 +25,6 @@ use glue::video::run_video_window;
 // }
 
 fn main() {
-    let _ = elogger!(run_video_window(1,4));
+    let _ = elogger!(run_video_window(0, 4));
     // let _ = elogger!(run_image_window());
 }
