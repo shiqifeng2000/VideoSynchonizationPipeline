@@ -1,0 +1,51 @@
+[package]
+name = "glue"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "glue"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# cudarc = "0.10"
+glow = "0.13"
+glutin = "0.32"
+glutin-winit = "0.5"
+winit = "0.30"
+raw-window-handle = "0.5"
+bytes = "1.11"
+anyhow = "1"
+log = "0.4.17"
+# env_logger = "0.11"
+log4rs = "1.2.0"
+image = "0.25"
+ctrlc = "3"
+rsmpeg = { version = "0.18", features = ["link_system_ffmpeg"] }
+crossbeam = "0.8"
+rand = "0.8.5"
+cpal = "0.17"
+lazy_static = "1.4.0"
+bytemuck = "1.25"
+ordered-float = "5.3"
+# spin-sleep = "1.3"
+# tokio = { version = "1.5", features = ["sync"] }
+# rayon = "1.11"
+# trackable = "1.3"
+# [dependencies]
+# winit = "0.30"
+# glutin = "0.32"
+# glutin-winit = "0.5"
+# glow = "0.13"
+
+[dev-dependencies]
+glium = "0.36"
+glam = "0.27"
+
+[build-dependencies]
+bindgen = "0.72"
+cbindgen = "0.28"
+
+# [profile.release]
+# panic = "abort"

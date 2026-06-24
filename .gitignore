@@ -1,0 +1,5 @@
+/target
+/bk
+test.log
+/log/*
+output/*/log
